@@ -41,7 +41,7 @@ func bytesToUint32(n []byte) uint32 {
 
 // Our format will be [gzip data] [block data]
 // Each block is stored as [checksum (4 bytes)+size (2 bytes)] in block data
-// Block data is structured in the form [0xabcd0000] [block] [block] ... [block] [rawSizeOfLastBlock (2 bytes)] [sizeOfBlockData (4 bytes)]
+// Block data is structured in the form [0xabcd] [block] [block] ... [block] [sizeOfBlockData (4 bytes)] [fake gzip footer (8 bytes)]
 // Compresses a file. Argument "size" is ignored.
 func CompressFile(in io.Reader, size int64, out io.Writer) error {
 	// Initialize writer to tempfile
