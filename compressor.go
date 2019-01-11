@@ -5,11 +5,10 @@ package press // POC Compressor
 import (
 	"log"
 	"io"
+	"io/ioutil"
 	"errors"
-	"hash/crc32"
-	"math"
 	"bytes"
-	"encoding/binary"
+	"compress/gzip"
 
 	"github.com/rasky/multigz"
 )
@@ -18,7 +17,7 @@ import (
 //const CompressionLevel = 0 // Worst-case compression
 const CompressionLevel = -1 // Default compression
 //const CompressionLevel = 9 // Max compression
-const BlockSize = 65502 // Let's only use a single size (2 bytes) for now
+const BlockSize = 131072 // We're using 4 bytes instead now! Here's a block size of 128KB!
 
 // Converts uint16 to bytes (little endian)
 func uint16ToBytes(n uint16) []byte {
@@ -30,6 +29,11 @@ func bytesToUint16(n []byte) uint16 {
 	return uint16(n[0])+(uint16(n[1])<<8)
 }
 
+// Converts uint32 to bytes (little endian)
+func uint32ToBytes(n uint32) []byte {
+	return append(uint16ToBytes(uint16(n%65536)), uint16ToBytes(uint16(n>>16))...)
+}
+
 // Converts bytes to uint32 (little endian)
 func bytesToUint32(n []byte) uint32 {
 	res := uint32(0)
@@ -38,6 +42,32 @@ func bytesToUint32(n []byte) uint32 {
 		res += uint32(n[i])
 	}
 	return res
+}
+
+// Size of gzip header and footer for gzip files that are storing block data in extra data fields
+const GzipHeaderSize = 10
+const GzipDataAndFooterSize = 10
+// Splits data into extra data in empty gzip files, followed by a gzip file storing the total length of all the prior gzip files as a uint32
+func gzipExtraify(in io.Reader, out io.Writer) {
+// These should be constant
+var gzipHeaderData = []byte{0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03} // A gzip header that allows for extra data
+var gzipContentAndFooter = []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} // Empty gzip content and footer
+
+	// Loop through the data, splitting it into up to 65535-byte chunks, then adding it to an empty gzip file as extra data
+	totalLength := uint32(0)
+	for {
+		currGzipData := make([]byte, 65535)
+		n, err := in.Read(currGzipData) // n is the length of the extra data that will be added
+		if err == io.EOF {
+			break
+		}
+		currGzipData = append(append(gzipHeaderData, uint16ToBytes(uint16(n))...), // n bytes
+			append(currGzipData[:n], gzipContentAndFooter...)...) // Data and footer
+		totalLength += uint32(len(currGzipData))
+		out.Write(currGzipData)
+	}
+	out.Write(append(gzipHeaderData, []byte{0x04, 0x00}...)) // 4 bytes
+	out.Write(append(uint32ToBytes(totalLength), gzipContentAndFooter...))
 }
 
 // Our format will be [gzip data] [block data]
@@ -55,56 +85,53 @@ func CompressFile(in io.Reader, size int64, out io.Writer) error {
 
 	// Write gzip
 	var blockStartPrev int64 = int64(0)
-	var blockData []byte = make([]byte, 2) // Prepend a garbage magic number to make sure this isn't recognized as a part of the gzip file (and so it's easier for me to find)
-	blockData[0] = 0xab
-	blockData[1] = 0xcd
-	// Initialize file hash (for gzip footer after block data)
-	fileHash := crc32.NewIEEE()
-	var lastBlockDecompressedSize uint32
+	var blockData []byte = make([]byte, 0)
 	for {
-		// Initialize hash, compress block and add to hash (and file hash)
-		hash := crc32.NewIEEE()
-		n, err := io.CopyN(io.MultiWriter(outw, hash, fileHash), in, BlockSize)
-		checksum := hash.Sum([]byte{})
+		// Compress block
+		n, err := io.CopyN(outw, in, BlockSize)
 
 		// Get offset and process
 		offset := outw.Offset()
-		if offset.Off != BlockSize && err != io.EOF {
+		log.Printf("Block = %d, Off = %d\n", offset.Block, offset.Off)
+		if err != io.EOF && offset.Off != 0 {
 			log.Println("error1")
-			return errors.New("Offset is expected equal BlockSize and this isn't the last block. This error should never occur.")
+			return errors.New("Offset is expected to equal 0 if this isn't the last block. This error should never occur.")
 		}
 		blockStart := offset.Block
-		blockSizeLarge := blockStart - blockStartPrev
-		log.Printf("%d %d\n", n, blockSizeLarge)
-		if blockSizeLarge > math.MaxUint16 {
-			log.Println("error2")
-			return errors.New("Compressed block size is larger than MaxUint16. This error should never occur.")
-		}
-		blockSize := uint16(blockSizeLarge) // Note: This is actually the uncompressed length of the PREVIOUS block.
-						    // If this is the first block, this value is always 0
+		blockSize := uint32(blockStart - blockStartPrev) // Note: This is actually the uncompressed length of the PREVIOUS block.
+								 // If this is the first block, this value is always 0
+		log.Printf("%d %d\n", n, blockSize)
 
-		// Append block size and checksum to block data and set current block start as previous block start
-		blockData = append(blockData, append(uint16ToBytes(blockSize), checksum...)...)
-		blockStartPrev = blockStart
-
-		// If this is the last block, copy over the uncompressed size of the block (we need this for both the gzip
-		// footer and our own processing)
+		// If this is the last block, add the size of the last block to the end of blockData and break
 		if err == io.EOF {
 			log.Printf("%d %d %d\n", n, byte(n%256), byte(n/256))
-			lastBlockDecompressedSize = uint32(n)
+			blockData = append(blockData, uint32ToBytes(uint32(n))...)
 			break
 		}
+
+		// Append block size to block data and move current block start to previous block start
+		blockData = append(blockData, uint32ToBytes(blockSize)...)
+		blockStartPrev = blockStart
 	}
 
-	// Close gzip Writer, and append block data, length of block data (4 bytes). This will be recognized by gunzip as "trailing garbage"
+	// Close gzip Writer for data
 	outw.Close()
-	out.Write(blockData)
-	blockDataLen := uint32(len(blockData))
-	binary.Write(out, binary.LittleEndian, blockDataLen)
 
-	// Write another (fake) footer to increase compatibility
-	out.Write(fileHash.Sum([]byte{})) // CRC-32 checksum of file
-	binary.Write(out, binary.LittleEndian, lastBlockDecompressedSize) // Decompressed size of last block
+	// Create gzip file containing block index data, stored in buffer
+	var b bytes.Buffer
+	gz := gzip.NewWriter(&b)
+	if _, err := gz.Write(blockData); err != nil {
+		panic(err)
+	}
+	if err := gz.Flush(); err != nil {
+		panic(err)
+	}
+	if err := gz.Close(); err != nil {
+		panic(err)
+	}
+
+	// Append extra data gzips to end of out
+	gzipExtraify(bytes.NewReader(b.Bytes()), out)
 
 	// Return success
 	return nil
@@ -114,85 +141,94 @@ func CompressFile(in io.Reader, size int64, out io.Writer) error {
 type Decompressor struct {
 	cursorPos *int64		// The current location we have seeked to
 	blockStarts []int64		// The start of each block. These will be recovered from the block sizes
-	blockChecksums []uint32		// Checksums should be uint32s
 	numBlocks uint32		// Number of blocks
 	decompressedSize int64		// Decompressed size of the file.
 	in *multigz.Reader		// Input
 }
 
-const InitialChunkLength = 2048 // Length of initial chunk to get. This will support up to ~20MB indexing without additional fetching of data
-const TrailingBytes = 4+8 // Number of bytes after block data (size index + fake footer) that aren't part of block data
-			  // Note: We assume size index will always be the first value and fake footer will always be the last in this
+// Decompression constants
+const LengthOffsetFromEnd = GzipDataAndFooterSize+4 // How far the 4-byte length of gzipped data is from the end
+const TrailingBytes = LengthOffsetFromEnd+2+GzipHeaderSize // This is the total size of the last gzip file in the stream, which is not included in the length of gzipped data
 
 // Initializes decompressor. Takes 2 reads if length of block data < InitialChunkLength or 3 reads otherwise
 func (d* Decompressor) init(in io.ReadSeeker, size int64) error {
 	// Initialize cursor position
 	d.cursorPos = new(int64)
 
-	// Read last chunk of file
-	lastChunkStart := size-InitialChunkLength
-	if lastChunkStart < 0 {
-		lastChunkStart = 0
-	}
-	in.Seek(lastChunkStart, io.SeekStart)
-	lastChunk := make([]byte, InitialChunkLength)
-	n, err := in.Read(lastChunk)
+	// Read length of gzipped block data in gzip extra data fields
+	in.Seek(size-LengthOffsetFromEnd, io.SeekStart)
+	gzippedBlockDataLenBytes := make([]byte, 4)
+	_, err := in.Read(gzippedBlockDataLenBytes)
 	if err != nil {
-		log.Printf("n = %d\n", n)
 		return err
 	}
-	if n != InitialChunkLength {
-		log.Printf("n = %d\n", n)
-		lastChunk = lastChunk[:n]
+	gzippedBlockDataLen := bytesToUint32(gzippedBlockDataLenBytes)
+
+	// Get gzipped block data in gzip extra data fields
+	log.Printf("size = %d, gzippedBlockDataLen = %d\n", size, gzippedBlockDataLen)
+	in.Seek(size-TrailingBytes-int64(gzippedBlockDataLen), io.SeekStart)
+	gzippedBlockData := make([]byte, gzippedBlockDataLen)
+	in.Read(gzippedBlockData)
+
+	// Get raw gzipped block data
+	gzippedBlockDataRaw := make([]byte, 0)
+	gzipHeaderDummy := make([]byte, GzipHeaderSize)
+	gzipExtraDataLenBytes := make([]byte, 2)
+	gzipDataAndFooterDummy := make([]byte, GzipDataAndFooterSize)
+	gzippedBlockDataRawReader := bytes.NewReader(gzippedBlockData)
+	for {
+		// This read and possibly the last read are the only ones which can EOF
+		_, err := gzippedBlockDataRawReader.Read(gzipHeaderDummy)
+		if err == io.EOF {
+			break
+		}
+		// Note: These reads should never EOF
+		gzippedBlockDataRawReader.Read(gzipExtraDataLenBytes)
+		gzipExtraDataLen := bytesToUint16(gzipExtraDataLenBytes)
+		log.Printf("%d", gzipExtraDataLen)
+		gzipExtraData := make([]byte, gzipExtraDataLen)
+		gzippedBlockDataRawReader.Read(gzipExtraData)
+		gzippedBlockDataRaw = append(gzippedBlockDataRaw, gzipExtraData...)
+		// Read the footer. This may EOF
+		_, err = gzippedBlockDataRawReader.Read(gzipDataAndFooterDummy)
+		if err == io.EOF {
+			break
+		}
 	}
-	lastChunkLen := uint32(len(lastChunk))
 
-	// Get metadata size
-	blockDataLen := bytesToUint32(lastChunk[lastChunkLen-TrailingBytes:lastChunkLen-TrailingBytes+4])
-
-	// Isolate the block data
-	var blockData []byte
-	log.Printf("lastChunkLen, blockDataLen = %d, %d", lastChunkLen, blockDataLen)
-	if blockDataLen < InitialChunkLength { // If we already have all the data, use it
-		blockData = lastChunk[lastChunkLen-TrailingBytes-blockDataLen:lastChunkLen-TrailingBytes]
-	} else { // If we don't, get it
-		blockData = make([]byte, blockDataLen)
-		in.Seek(-TrailingBytes-int64(blockDataLen), io.SeekEnd)
-		in.Read(blockData)
+	// Decompress gzipped block data
+	blockDataReader, err := gzip.NewReader(bytes.NewReader(gzippedBlockDataRaw))
+	if err != nil {
+		return err
+	}
+	blockData, err := ioutil.ReadAll(blockDataReader)
+	if err != nil {
+		return err
 	}
 
 	// Parse the block data
-	log.Printf("metadata len = %d\n", bytesToUint32(lastChunk[lastChunkLen-4:]))
-	if blockData[0] != 0xab || blockData[1] != 0xcd {
-		return errors.New("Unrecognized magic number; file may be corrupted")
+	blockDataLen := len(blockData)
+	log.Printf("metadata len = %d\n", blockDataLen)
+	if blockDataLen%4 != 0 {
+		return errors.New("Length of block data should be a multiple of 4; file may be corrupted")
 	}
-	if blockData[2] != 0x00 || blockData[3] != 0x00 {
-		return errors.New("Length before first block should always be 0; file may be corrupted")
-	}
-	if (blockDataLen-2)%6 != 0 {
-		return errors.New("Length of block data should be 2 plus a multiple of 6; file may be corrupted")
-	}
-	d.numBlocks = (blockDataLen-2)/6
+	d.numBlocks = uint32((blockDataLen-4)/4)
 	log.Printf("numblocks = %d\n", d.numBlocks)
 	d.blockStarts = make([]int64, d.numBlocks)
-	d.blockChecksums = make([]uint32, d.numBlocks)
 	currentBlockPosition := int64(0)
-	for i := uint32(0); i < d.numBlocks; i++ { // Loop through block data, getting checksums and starts of blocks.
-		bs := i*6+4 // Location of start of block data. Note: We're skipping the length before the first block so we don't record two 0's
-			    // in currentBlockPosition
-		currentBlockChecksum := bytesToUint32(blockData[bs:bs+4])
-		currentBlockSize := bytesToUint16(blockData[bs+4:bs+6])
-		d.blockStarts[i] = currentBlockPosition // Note: Remember that the first entry will always be 0
-		d.blockChecksums[i] = currentBlockChecksum
+	for i := uint32(0); i < d.numBlocks; i++ { // Loop through block data, getting starts of blocks.
+		bs := i*4 // Location of start of data for our current block
+		d.blockStarts[i] = currentBlockPosition // Note: Remember that the first entry can be anything now, but we're making the first
+							// of this array still always 0 for easier indexing
+		currentBlockSize := bytesToUint32(blockData[bs:bs+4])
 		currentBlockPosition += int64(currentBlockSize) // Note: We increase the current block position after
 							// recording the size (the size is for the current block this time, though)
 	}
 
 	log.Printf("Block Starts: %v\n", d.blockStarts)
-	log.Printf("Block Checksums: %v\n", d.blockChecksums)
 
 	// Get uncompressed size of last block and derive uncompressed size of file
-	lastBlockRawSize := bytesToUint32(lastChunk[lastChunkLen-4:])
+	lastBlockRawSize := bytesToUint32(blockData[blockDataLen-4:])
 	d.decompressedSize = int64((d.numBlocks-1) * BlockSize + uint32(lastBlockRawSize))
 
 	// Initialize cursor position and create reader
@@ -205,88 +241,26 @@ func (d* Decompressor) init(in io.ReadSeeker, size int64) error {
 }
 
 // Reads data using a decompressor
-func (d Decompressor) Read(p []byte) (int, error) {
-	log.Printf("Cursor pos before: %d\n", *d.cursorPos)
-	// Check if we're at the end of the file or before the beginning of the file
-	if *d.cursorPos >= d.decompressedSize || *d.cursorPos < 0 {
-		log.Println("Out of bounds EOF")
+func (d Decompressor) Read(p []byte) (int, error) {	
+	// Check if this is off the ends of the file
+	blockNumber := *d.cursorPos / BlockSize
+	if blockNumber < 0 || blockNumber >= int64(d.numBlocks) {
 		return 0, io.EOF
 	}
 
-	// Get block range to read and seek to it in multigz
+	// Get where read and seek to it in multigz
+	log.Printf("block # = %d", blockNumber)
 	var mgzOffset multigz.Offset
-	blockToRead := *d.cursorPos / BlockSize
-	blockOffset := *d.cursorPos % BlockSize
-	if blockToRead > 0 {
-		mgzOffset.Block = d.blockStarts[*d.cursorPos / BlockSize - 1]
-		mgzOffset.Off = BlockSize
-	} else {
-		mgzOffset.Block = 0
-		mgzOffset.Off = 0
-	}
+	mgzOffset.Block = d.blockStarts[blockNumber]
+	mgzOffset.Off = *d.cursorPos % BlockSize
 	err := d.in.Seek(mgzOffset)
-	if err != nil {
-		return 0, err
-	}
 
-	// Get number of blocks to read
-	bytesToRead := len(p)
-	blocksToRead := (int64(bytesToRead) + blockOffset) / int64(BlockSize) + 1
+	// Read stuff
+	n, err := d.in.Read(p)
 
-	log.Printf("bytesTR = %d, blocksTR = %d, block#TR = %d, blockOff = %d\n", bytesToRead, blocksToRead, blockToRead, blockOffset)
-
-	// Read block range
-	// Our reader is currently at d.blockStarts[*d.cursorPos / BlockSize - 1] + BlockSize or 0.
-	// We want to read to the beginning of d.blockStarts[*d.cursorPos / BlockSize + blocksToRead] or to the end
-	currBlock := *d.cursorPos / BlockSize
-	var blockBytes []byte;
-
-	// Read blocksToRead blocks and slice off unused bytes if there are any
-	blockBytes = make([]byte, blocksToRead * BlockSize)
-	n, _ := d.in.Read(blockBytes)
-	if n != int(blocksToRead * BlockSize) {
-		blockBytes = blockBytes[:n]
-	}
-	// Increment cursor position based on whichever is smaller: bytes read or bytes to read
-	bytesRead := n-int(blockOffset)
-	if bytesRead < bytesToRead {
-		*d.cursorPos += int64(bytesRead)
-	} else {
-		*d.cursorPos += int64(bytesToRead)
-	}
-	log.Printf("bytesRead = %d, bytesToRead = %d\n", bytesRead, bytesToRead)
-
-//	log.Printf("%d %s\n", len(blockBytes), string(blockBytes))
-
-	// Integrity verification of blocks
-	blockReader := bytes.NewReader(blockBytes)
-	for i := int64(0); i < blocksToRead; i++ {
-		hash := crc32.NewIEEE()
-		n, err := io.CopyN(hash, blockReader, BlockSize)
-		sum := hash.Sum([]byte{})
-		log.Printf("Bytes checksummed = %d\n", n)
-		log.Printf("Checksum %d vs %d\n", bytesToUint32(sum), d.blockChecksums[currBlock + i])
-		if bytesToUint32(sum) != d.blockChecksums[currBlock + i] { // Checksum failed
-			return 0, errors.New("Checksum verification failed")
-		}
-		if err == io.EOF {
-			break
-		}
-	}
-
-	// Copy blockBytes over to output
-	var copiedBytes int
-	for copiedBytes = 0; (copiedBytes < bytesToRead) && (copiedBytes+int(blockOffset) < len(blockBytes)); copiedBytes++ {
-		p[copiedBytes] = blockBytes[copiedBytes+int(blockOffset)]
-	}
-
-	// Check if we've reached the end of the file and return accordingly
-	log.Printf("Cursor pos = %d\n", *d.cursorPos)
-	if *d.cursorPos >= d.decompressedSize {
-		log.Println("EOF")
-		return copiedBytes, io.EOF
-	}
-	return copiedBytes, nil
+	// Increment cursor position and return
+	*d.cursorPos += int64(n)
+	return n, err
 }
 
 // Seeks to a location in compressed stream
@@ -299,6 +273,7 @@ func (d Decompressor) Seek(offset int64, whence int) (int64, error) {
 	} else if whence == io.SeekEnd {
 		*d.cursorPos = d.decompressedSize + offset
 	}
+
 	// Return
 	return offset, nil
 }

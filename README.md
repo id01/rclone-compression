@@ -4,12 +4,20 @@ This is a prototype. Weird things may happen.
 
 Configurable constants:
 * CompressionLevel: Gzip Compression Level
-* BlockSize: Size of each gzip block. Up to 65502 can be indexed in 2 bytes. Currently hard coded to use two bytes per block index.
-* InitialChunkLength: Size of the initial chunk to get from the end of the file. If this is large enough, it will not be necessary to re-read metadata.
+* BlockSize: Size of each gzip block. This can be up to 4GB. Larger blocks means better compression. Smaller blocks means faster download of small portions of the file.
+
+Other constants (or variables that act like constants):
+* gzipHeaderData in gzipExtraify: The data contained in our gzip header.
+	* This is currently configured to allow us an extra data field with no other extra fields.
+	* POSIX modification time is locked to 0, and operating system is locked to Linux.
+* gzipContentAndFooter in gzipExtraify: The data contained in our gzip content and footer.
+	* This is the same as an empty file. CRC-32 checksum and decompressed size are both 0
+* GzipHeaderSize: size of gzipHeaderData
+* GzipDataAndFooterSize: size of gzipContentAndFooter
+* LengthOffsetFromEnd: Offset from end where we can find the size of our gzip files with block data in the extra data fields
+* TrailingBytes: Bytes after our block data gzip files
 
 Structure of file:
 * gzip data
-* 0xabcd (to make sure this isn't recognized as another gzip file or block)
-* block data (consisting of 6 byte precedingSize-checksum combos)
-* size of block data (4 bytes)
-* fake gzip footer (8 bytes)
+* empty gzip files containing block data (block data is gzipped into a gzip file then split among extra data fields in empty gzip files)
+* empty gzip file containing total size of all block data gzip files
