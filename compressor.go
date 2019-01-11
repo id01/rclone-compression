@@ -70,9 +70,6 @@ var gzipContentAndFooter = []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 	out.Write(append(uint32ToBytes(totalLength), gzipContentAndFooter...))
 }
 
-// Our format will be [gzip data] [block data]
-// Each block is stored as [checksum (4 bytes)+size (2 bytes)] in block data
-// Block data is structured in the form [0xabcd] [block] [block] ... [block] [sizeOfBlockData (4 bytes)] [fake gzip footer (8 bytes)]
 // Compresses a file. Argument "size" is ignored.
 func CompressFile(in io.Reader, size int64, out io.Writer) error {
 	// Initialize writer to tempfile
