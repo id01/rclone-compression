@@ -44,7 +44,7 @@ func TestDecompressFile(t *testing.T) {
 	}
 	t.Logf("Decompressed size: %d\n", decompressedSize)
 	for {
-		_, err := io.CopyN(outFil, FileHandle, 12345)
+		_, err := io.CopyN(outFil, FileHandle, 123456)
 		if err == io.EOF {
 			break
 		}

@@ -99,16 +99,16 @@ func CompressFile(in io.Reader, size int64, out io.Writer) error {
 								 // If this is the first block, this value is always 0
 		log.Printf("%d %d\n", n, blockSize)
 
+		// Append block size to block data and move current block start to previous block start
+		blockData = append(blockData, uint32ToBytes(blockSize)...)
+		blockStartPrev = blockStart
+
 		// If this is the last block, add the size of the last block to the end of blockData and break
 		if err == io.EOF {
 			log.Printf("%d %d %d\n", n, byte(n%256), byte(n/256))
 			blockData = append(blockData, uint32ToBytes(uint32(n))...)
 			break
 		}
-
-		// Append block size to block data and move current block start to previous block start
-		blockData = append(blockData, uint32ToBytes(blockSize)...)
-		blockStartPrev = blockStart
 	}
 
 	// Close gzip Writer for data
@@ -246,7 +246,7 @@ func (d Decompressor) Read(p []byte) (int, error) {
 	}
 
 	// Get where read and seek to it in multigz
-	log.Printf("block # = %d", blockNumber)
+	log.Printf("block # = %d @ %d", blockNumber, *d.cursorPos)
 	var mgzOffset multigz.Offset
 	mgzOffset.Block = d.blockStarts[blockNumber]
 	mgzOffset.Off = *d.cursorPos % BlockSize
@@ -254,6 +254,11 @@ func (d Decompressor) Read(p []byte) (int, error) {
 
 	// Read stuff
 	n, err := d.in.Read(p)
+
+	// If nothing was copied, we EOF'd
+	if n == 0 {
+		return 0, io.EOF
+	}
 
 	// Increment cursor position and return
 	*d.cursorPos += int64(n)
