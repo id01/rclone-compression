@@ -17,6 +17,7 @@ import (
 // Constants
 //const CompressionLevel = 0 // Worst-case compression
 const CompressionLevel = -1 // Default compression
+//const CompressionLevel = 9 // Max compression
 const BlockSize = 65502 // Let's only use a single size (2 bytes) for now
 
 // Converts uint16 to bytes (little endian)
@@ -111,7 +112,7 @@ func CompressFile(in io.Reader, size int64, out io.Writer) error {
 
 // ReadSeeker implementation for decompression
 type Decompressor struct {
-	cursorPos *int64			// The current location we have seeked to
+	cursorPos *int64		// The current location we have seeked to
 	blockStarts []int64		// The start of each block. These will be recovered from the block sizes
 	blockChecksums []uint32		// Checksums should be uint32s
 	numBlocks uint32		// Number of blocks
