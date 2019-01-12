@@ -1,5 +1,5 @@
-Rclone-MGZ  
-Code for rclone multigz integration.  
+Rclone-compression  
+Code for rclone compression integration.  
 This is a prototype. Weird things may happen.
 
 Configurable constants are located and explained at the top of the file.

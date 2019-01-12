@@ -23,15 +23,15 @@ const (
 )
 
 // Constants
-/*
+
 // Gzip compression configuration
 const CompressionMode = GZIP_DEFAULT // Compression mode
 const BlockSize = 131072 // We're using 4 bytes instead now! Here's a block size of 128KB!
-*/
+
 
 // XZ compression configuration
-const CompressionMode = XZ_IN_GZ // Compression mode
-const BlockSize = 1048576 // XZ needs larger block sizes to be more effective. Here's a 1MB block size.
+//const CompressionMode = XZ_IN_GZ // Compression mode
+//const BlockSize = 1048576 // XZ needs larger block sizes to be more effective. Here's a 1MB block size.
 
 // Other compression configuration
 const MaxCompressedBlockSize = BlockSize+256 // Just in case
@@ -61,9 +61,9 @@ func GetFileExtension(reader io.Reader) (compressed bool, extension string, err 
 
 	// If the file is compressible, select file extension based on compression mode
 	switch CompressionMode {
-		case GZIP_STORE: // See below
-		case GZIP_MIN: // See below
-		case GZIP_DEFAULT: // See below
+		case GZIP_STORE: fallthrough
+		case GZIP_MIN: fallthrough
+		case GZIP_DEFAULT: fallthrough
 		case GZIP_MAX: return true, ".bin.gz", nil
 		case XZ_IN_GZ: return true, ".xz.gz", nil
 	}
@@ -347,9 +347,9 @@ func decompressBlockRangeXz(in io.Reader, out io.Writer) (n int, err error) {
 // Wrapper function to decompress a block range
 func decompressBlockRange(in io.Reader, out io.Writer) (n int, err error) {
 	switch CompressionMode { // Select decompression function based off compression mode
-		case GZIP_STORE: // See below
-		case GZIP_MIN: // See below
-		case GZIP_DEFAULT: // See below
+		case GZIP_STORE: fallthrough
+		case GZIP_MIN: fallthrough
+		case GZIP_DEFAULT: fallthrough
 		case GZIP_MAX: return decompressBlockRangeGz(in, out)
 		case XZ_IN_GZ: return decompressBlockRangeXz(in, out)
 	}
