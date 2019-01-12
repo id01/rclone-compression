@@ -20,6 +20,7 @@ const (
 	GZIP_DEFAULT = iota
 	GZIP_MAX = iota
 	XZ_IN_GZ = iota
+	LZ4_IN_GZ = iota
 )
 
 // Constants
@@ -28,20 +29,39 @@ const (
 const CompressionMode = GZIP_DEFAULT // Compression mode
 const BlockSize = 131072 // We're using 4 bytes instead now! Here's a block size of 128KB!
 
-
 // XZ compression configuration
 //const CompressionMode = XZ_IN_GZ // Compression mode
 //const BlockSize = 1048576 // XZ needs larger block sizes to be more effective. Here's a 1MB block size.
+
+// LZ4 compression configuration
+//const CompressionMode = LZ4_IN_GZ // Compression mode
+//const BlockSize = 131072 // Same as gzip.
 
 // Other compression configuration
 const MaxCompressedBlockSize = BlockSize+256 // Just in case
 const NumThreads = 4 // Number of threads to use for compression
 const HeuristicBytes = 1048576 // Bytes to perform gzip heuristic on to determine whether a file should be compressed
 const MaxCompressionRatio = 0.9 // Maximum compression ratio for a file to be compressed
+
+// Compression binary paths
 const XZCommand = "/usr/bin/xz" // Path to xz binary (if available)
+const LZ4Command = "/usr/bin/lz4" // Path to lz4 binary (if available)
 
 /*** UTILITY FUNCTIONS ***/
-func GetFileExtension(reader io.Reader) (compressed bool, extension string, err error) {
+// Gets file extension for current compression mode
+func GetFileExtension() string {
+	switch CompressionMode {
+		case GZIP_STORE: fallthrough
+		case GZIP_MIN: fallthrough
+		case GZIP_DEFAULT: fallthrough
+		case GZIP_MAX: return ".bin.gz"
+		case XZ_IN_GZ: return ".xz.gz"
+		case LZ4_IN_GZ: return ".lz4.gz"
+	}
+	panic("Compression mode doesn't exist")
+}
+// Gets a file extension along with compressibility of file
+func GetFileCompressionInfo(reader io.Reader) (compressable bool, extension string, err error) {
 	// Use gzip-min to do a fast heuristic on the first few bytes
 	var emulatedBlock, emulatedBlockCompressed bytes.Buffer
 	_, err = io.CopyN(&emulatedBlock, reader, HeuristicBytes)
@@ -60,14 +80,7 @@ func GetFileExtension(reader io.Reader) (compressed bool, extension string, err 
 	}
 
 	// If the file is compressible, select file extension based on compression mode
-	switch CompressionMode {
-		case GZIP_STORE: fallthrough
-		case GZIP_MIN: fallthrough
-		case GZIP_DEFAULT: fallthrough
-		case GZIP_MAX: return true, ".bin.gz", nil
-		case XZ_IN_GZ: return true, ".xz.gz", nil
-	}
-	return false, "", errors.New("Compression mode doesn't exist") // If none of the above returned
+	return true, GetFileExtension(), nil
 }
 
 /*** BYTE CONVERSION FUNCTIONS ***/
@@ -145,16 +158,16 @@ func compressBlockGz(in io.Reader, out io.Writer, compressionLevel int) (compres
 	return blockSize, n, err
 }
 
-// Function that compresses a block using xz (lzma). Requires an xz binary.
-func compressBlockXz(in io.Reader, out io.Writer) (compressedSize uint32, uncompressedSize int64, err error) {
-	// Initialize xz subprocess
-	subprocess := exec.Command(XZCommand, "-c")
+// Function that compresses a block using a shell command. Requires an binary corresponding with the command.
+func compressBlockExec(in io.Reader, out io.Writer, binaryPath string) (compressedSize uint32, uncompressedSize int64, err error) {
+	// Initialize compression subprocess
+	subprocess := exec.Command(binaryPath, "-c")
 	stdin, err := subprocess.StdinPipe()
 	if err != nil {
 		return 0, 0, err
 	}
 
-	// Run subprocess that creates xz file
+	// Run subprocess that creates compressed file
 	nChan := make(chan int64)
 	go func() {
 		n, _ := io.Copy(stdin, in)
@@ -181,9 +194,10 @@ func compressBlock(in io.Reader, out io.Writer) (compressedSize uint32, uncompre
 		case GZIP_MIN: return compressBlockGz(in, out, 1)
 		case GZIP_DEFAULT: return compressBlockGz(in, out, 6)
 		case GZIP_MAX: return compressBlockGz(in, out, 9)
-		case XZ_IN_GZ: return compressBlockXz(in, out)
+		case XZ_IN_GZ: return compressBlockExec(in, out, XZCommand)
+		case LZ4_IN_GZ: return compressBlockExec(in, out, LZ4Command)
 	}
-	return 0, 0, errors.New("Compression mode doesn't exist") // If none of the above returned
+	panic("Compression mode doesn't exist")
 }
 
 /*** MAIN COMPRESSION INTERFACE ***/
@@ -312,8 +326,8 @@ func decompressBlockRangeGz(in io.Reader, out io.Writer) (n int, err error) {
 	return int(written), err
 }
 
-// Utility function to decompress a block range using xz (lzma)
-func decompressBlockRangeXz(in io.Reader, out io.Writer) (n int, err error) {
+// Utility function to decompress a block range using a shell command
+func decompressBlockRangeExec(in io.Reader, out io.Writer, binaryPath string) (n int, err error) {
 	// "Decompress" gzip (this should be in store mode)
 	var b bytes.Buffer
 	_, err = decompressBlockRangeGz(in, &b)
@@ -321,15 +335,15 @@ func decompressBlockRangeXz(in io.Reader, out io.Writer) (n int, err error) {
 		return 0, err
 	}
 
-	// Decompress xz
-	// Initialize xz subprocess
-	subprocess := exec.Command(XZCommand, "-dc")
+	// Decompress actual compression
+	// Initialize decompression subprocess
+	subprocess := exec.Command(binaryPath, "-dc")
 	stdin, err := subprocess.StdinPipe()
 	if err != nil {
 		return 0, err
 	}
 
-	// Run subprocess that creates xz file
+	// Run subprocess that copies over compressed block
 	go func() {
 		defer stdin.Close()
 		io.Copy(stdin, &b)
@@ -351,9 +365,10 @@ func decompressBlockRange(in io.Reader, out io.Writer) (n int, err error) {
 		case GZIP_MIN: fallthrough
 		case GZIP_DEFAULT: fallthrough
 		case GZIP_MAX: return decompressBlockRangeGz(in, out)
-		case XZ_IN_GZ: return decompressBlockRangeXz(in, out)
+		case XZ_IN_GZ: return decompressBlockRangeExec(in, out, XZCommand)
+		case LZ4_IN_GZ: return decompressBlockRangeExec(in, out, LZ4Command)
 	}
-	return 0, errors.New("Compression mode doesn't exist") // If none of the above returned
+	panic("Compression mode doesn't exist") // If none of the above returned
 }
 
 /*** MAIN DECOMPRESSION INTERFACE ***/

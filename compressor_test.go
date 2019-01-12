@@ -8,7 +8,6 @@ import (
 )
 
 const testFileName = "test.txt"
-const testFile = "test.txt.xz.gz"
 const outFileName = "testRead.txt"
 const outFileName2 = "testSeek.txt"
 
@@ -17,7 +16,7 @@ func TestCompressFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	outFil, err := os.Create(testFile)
+	outFil, err := os.Create(testFileName+GetFileExtension())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,11 +25,11 @@ func TestCompressFile(t *testing.T) {
 }
 
 func TestDecompressFile(t *testing.T) {
-	inFileInfo, err := os.Stat(testFile)
+	inFileInfo, err := os.Stat(testFileName+GetFileExtension())
 	if err != nil {
 		t.Fatal(err)
 	}
-	inFile, err := os.Open(testFile)
+	inFile, err := os.Open(testFileName+GetFileExtension())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,11 +56,11 @@ func TestDecompressFile(t *testing.T) {
 }
 
 func TestSeek(t *testing.T) {
-	inFileInfo, err := os.Stat(testFile)
+	inFileInfo, err := os.Stat(testFileName+GetFileExtension())
 	if err != nil {
 		t.Fatal(err)
 	}
-	inFile, err := os.Open(testFile)
+	inFile, err := os.Open(testFileName+GetFileExtension())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,18 +88,18 @@ func TestSeek(t *testing.T) {
 	outFil.Close()
 }
 
-func TestFileExtension(t *testing.T) {
+func TestFileCompressionInfo(t *testing.T) {
 	inFile, err := os.Open(testFileName)
 	if err != nil {
 		t.Fatal(err)
 	}
-	inFile2, err := os.Open(testFile)
+	inFile2, err := os.Open(testFileName+GetFileExtension())
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, extension, err := GetFileExtension(inFile)
+	_, extension, err := GetFileCompressionInfo(inFile)
 	t.Logf("Extension for uncompressed: %s\n", extension)
-	_, extension, err = GetFileExtension(inFile2)
+	_, extension, err = GetFileCompressionInfo(inFile2)
 	t.Logf("Extension for compressed: %s\n", extension)
 	inFile.Close()
 }
