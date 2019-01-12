@@ -8,17 +8,69 @@ import (
 	"io/ioutil"
 	"errors"
 	"bytes"
+	"bufio"
 	"compress/gzip"
+	"os/exec"
+)
 
-	"github.com/rasky/multigz"
+// Compression modes
+const (
+	GZIP_STORE = iota
+	GZIP_MIN = iota
+	GZIP_DEFAULT = iota
+	GZIP_MAX = iota
+	XZ_IN_GZ = iota
 )
 
 // Constants
-//const CompressionLevel = 0 // Worst-case compression
-const CompressionLevel = -1 // Default compression
-//const CompressionLevel = 9 // Max compression
+/*
+// Gzip compression configuration
+const CompressionMode = GZIP_DEFAULT // Compression mode
 const BlockSize = 131072 // We're using 4 bytes instead now! Here's a block size of 128KB!
+*/
 
+// XZ compression configuration
+const CompressionMode = XZ_IN_GZ // Compression mode
+const BlockSize = 1048576 // XZ needs larger block sizes to be more effective. Here's a 1MB block size.
+
+// Other compression configuration
+const MaxCompressedBlockSize = BlockSize+256 // Just in case
+const NumThreads = 4 // Number of threads to use for compression
+const HeuristicBytes = 1048576 // Bytes to perform gzip heuristic on to determine whether a file should be compressed
+const MaxCompressionRatio = 0.9 // Maximum compression ratio for a file to be compressed
+const XZCommand = "/usr/bin/xz" // Path to xz binary (if available)
+
+/*** UTILITY FUNCTIONS ***/
+func GetFileExtension(reader io.Reader) (compressed bool, extension string, err error) {
+	// Use gzip-min to do a fast heuristic on the first few bytes
+	var emulatedBlock, emulatedBlockCompressed bytes.Buffer
+	_, err = io.CopyN(&emulatedBlock, reader, HeuristicBytes)
+	if err != nil {
+		return false, "", err
+	}
+	compressedSize, uncompressedSize, err := compressBlockGz(&emulatedBlock, &emulatedBlockCompressed, 1)
+	if err != nil {
+		return false, "", err
+	}
+	compressionRatio := float64(compressedSize) / float64(uncompressedSize)
+
+	// If the data is not compressible, return so
+	if compressionRatio > MaxCompressionRatio {
+		return false, ".bin.bin", nil
+	}
+
+	// If the file is compressible, select file extension based on compression mode
+	switch CompressionMode {
+		case GZIP_STORE: // See below
+		case GZIP_MIN: // See below
+		case GZIP_DEFAULT: // See below
+		case GZIP_MAX: return true, ".bin.gz", nil
+		case XZ_IN_GZ: return true, ".xz.gz", nil
+	}
+	return false, "", errors.New("Compression mode doesn't exist") // If none of the above returned
+}
+
+/*** BYTE CONVERSION FUNCTIONS ***/
 // Converts uint16 to bytes (little endian)
 func uint16ToBytes(n uint16) []byte {
 	return []byte{byte(n%256), byte(n>>8)}
@@ -44,15 +96,15 @@ func bytesToUint32(n []byte) uint32 {
 	return res
 }
 
+/*** BLOCK DATA SERIALIZATION FUNCTIONS ***/
+// These should be constant
+var gzipHeaderData = []byte{0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03} // A gzip header that allows for extra data
+var gzipContentAndFooter = []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} // Empty gzip content and footer
 // Size of gzip header and footer for gzip files that are storing block data in extra data fields
 const GzipHeaderSize = 10
 const GzipDataAndFooterSize = 10
 // Splits data into extra data in empty gzip files, followed by a gzip file storing the total length of all the prior gzip files as a uint32
 func gzipExtraify(in io.Reader, out io.Writer) {
-// These should be constant
-var gzipHeaderData = []byte{0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03} // A gzip header that allows for extra data
-var gzipContentAndFooter = []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} // Empty gzip content and footer
-
 	// Loop through the data, splitting it into up to 65535-byte chunks, then adding it to an empty gzip file as extra data
 	totalLength := uint32(0)
 	for {
@@ -70,49 +122,163 @@ var gzipContentAndFooter = []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 	out.Write(append(uint32ToBytes(totalLength), gzipContentAndFooter...))
 }
 
-// Compresses a file. Argument "size" is ignored.
-func CompressFile(in io.Reader, size int64, out io.Writer) error {
-	// Initialize writer to tempfile
-	var outw multigz.Writer
-	outw, err := multigz.NewWriterLevel(out, CompressionLevel, BlockSize) // I suppose we'd to well to line up BlockSize with the compression block size;
-									    // this will make Offset always equal BlockSize for any blocks
+/*** BLOCK COMPRESSION FUNCTIONS ***/
+// Function that compresses a block using gzip
+func compressBlockGz(in io.Reader, out io.Writer, compressionLevel int) (compressedSize uint32, uncompressedSize int64, err error) {
+	// Initialize buffer
+	bufw := bufio.NewWriterSize(out, MaxCompressedBlockSize)
+
+	// Initialize block writer
+	outw, err := gzip.NewWriterLevel(bufw, compressionLevel)
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
 
+	// Compress block
+	n, err := io.Copy(outw, in)
+
+	// Finalize gzip file, flush buffer and return
+	outw.Close()
+	blockSize := uint32(bufw.Buffered())
+	bufw.Flush()
+
+	return blockSize, n, err
+}
+
+// Function that compresses a block using xz (lzma). Requires an xz binary.
+func compressBlockXz(in io.Reader, out io.Writer) (compressedSize uint32, uncompressedSize int64, err error) {
+	// Initialize xz subprocess
+	subprocess := exec.Command(XZCommand, "-c")
+	stdin, err := subprocess.StdinPipe()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Run subprocess that creates xz file
+	nChan := make(chan int64)
+	go func() {
+		n, _ := io.Copy(stdin, in)
+		stdin.Close()
+		nChan <- n
+	}()
+
+	// Get output
+	output, err := subprocess.Output()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Store in gzip and return
+	blockSize, _, err := compressBlockGz(bytes.NewReader(output), out, 0)
+
+	return blockSize, <-nChan, err
+}
+
+// Wrapper function to compress a block
+func compressBlock(in io.Reader, out io.Writer) (compressedSize uint32, uncompressedSize int64, err error) {
+	switch CompressionMode { // Select compression function (and arguments) based on compression mode
+		case GZIP_STORE: return compressBlockGz(in, out, 0)
+		case GZIP_MIN: return compressBlockGz(in, out, 1)
+		case GZIP_DEFAULT: return compressBlockGz(in, out, 6)
+		case GZIP_MAX: return compressBlockGz(in, out, 9)
+		case XZ_IN_GZ: return compressBlockXz(in, out)
+	}
+	return 0, 0, errors.New("Compression mode doesn't exist") // If none of the above returned
+}
+
+/*** MAIN COMPRESSION INTERFACE ***/
+// Result of compression for a single block (gotten by a single thread)
+type CompressionResult struct {
+	buffer *bytes.Buffer
+	blockSize uint32
+	n int64
+	err error
+}
+
+// Compresses a file. Argument "size" is ignored.
+func CompressFile(in io.Reader, size int64, out io.Writer) error {
+	// Initialize buffered writer
+	bufw := bufio.NewWriterSize(out, MaxCompressedBlockSize*NumThreads)
+
 	// Write gzip
-	var blockStartPrev int64 = int64(0)
 	var blockData []byte = make([]byte, 0)
 	for {
-		// Compress block
-		n, err := io.CopyN(outw, in, BlockSize)
+		// Loop through threads, spawning a go procedure for each thread. If we get eof on one thread, set eofAt to that thread and break
+		var compressionResults [NumThreads]chan CompressionResult
+		eofAt := -1
+		for i := 0; i < NumThreads; i++ {
+			// Create thread channel and allocate buffer to pass to thread
+			compressionResults[i] = make(chan CompressionResult)
+			var inputBuffer bytes.Buffer
+			_, err := io.CopyN(&inputBuffer, in, BlockSize)
+			if err == io.EOF {
+				eofAt = i
+			} else if err != nil {
+				return err
+			}
+			// Run thread
+			go func(i int, in io.Reader, bufw io.Writer){
+				// Initialize thread writer and result struct
+				var res CompressionResult
+				var buffer bytes.Buffer
 
-		// Get offset and process
-		offset := outw.Offset()
-		log.Printf("Block = %d, Off = %d\n", offset.Block, offset.Off)
-		if err != io.EOF && offset.Off != 0 {
-			log.Println("error1")
-			return errors.New("Offset is expected to equal 0 if this isn't the last block. This error should never occur.")
+				// Compress block
+				blockSize, n, err := compressBlock(in, &buffer)
+				if err != nil && err != io.EOF { // This errored out.
+					res.buffer = nil
+					res.blockSize = 0
+					res.n = 0
+					res.err = err
+					compressionResults[i] <- res
+					return
+				}
+				// Pass our data back to the main thread as a compression result
+				res.buffer = &buffer
+				res.blockSize = blockSize
+				res.n = n
+				res.err = err
+				compressionResults[i] <- res
+				return
+			}(i, &inputBuffer, bufw)
+			// If we have reached eof, we don't need more threads
+			if eofAt != -1 {
+				break
+			}
 		}
-		blockStart := offset.Block
-		blockSize := uint32(blockStart - blockStartPrev) // Note: This is actually the uncompressed length of the PREVIOUS block.
-								 // If this is the first block, this value is always 0
-		log.Printf("%d %d\n", n, blockSize)
 
-		// Append block size to block data and move current block start to previous block start
-		blockData = append(blockData, uint32ToBytes(blockSize)...)
-		blockStartPrev = blockStart
+		// Process writers in order
+		for i := 0; i < NumThreads; i++ {
+			if compressionResults[i] != nil {
+				// Get current compression result, get buffer, and copy buffer over to output
+				res := <-compressionResults[i]
+				close(compressionResults[i])
+				if res.buffer == nil {
+					return res.err
+				}
+				io.Copy(bufw, res.buffer)
+				log.Printf("%d %d\n", res.n, res.blockSize)
 
-		// If this is the last block, add the size of the last block to the end of blockData and break
-		if err == io.EOF {
-			log.Printf("%d %d %d\n", n, byte(n%256), byte(n/256))
-			blockData = append(blockData, uint32ToBytes(uint32(n))...)
+				// Append block size to block data
+				blockData = append(blockData, uint32ToBytes(res.blockSize)...)
+
+				// If this is the last block, add the raw size of the last block to the end of blockData and break
+				if eofAt == i {
+					log.Printf("%d %d %d\n", res.n, byte(res.n%256), byte(res.n/256))
+					blockData = append(blockData, uint32ToBytes(uint32(res.n))...)
+					break
+				}
+			}
+		}
+
+		// Get number of bytes written in this block (they should all be in the bufio buffer), then close gzip and flush buffer
+		bufw.Flush()
+
+		// If eof happened, break
+		if eofAt != -1 {
+			log.Printf("%d", eofAt)
 			break
 		}
 	}
-
-	// Close gzip Writer for data
-	outw.Close()
 
 	// Create gzip file containing block index data, stored in buffer
 	var b bytes.Buffer
@@ -127,27 +293,84 @@ func CompressFile(in io.Reader, size int64, out io.Writer) error {
 		panic(err)
 	}
 
-	// Append extra data gzips to end of out
+	// Append extra data gzips to end of bufw, then flush bufw
 	gzipExtraify(bytes.NewReader(b.Bytes()), out)
+	bufw.Flush()
 
 	// Return success
 	return nil
 }
 
+/*** BLOCK DECOMPRESSION FUNCTIONS ***/
+// Utility function to decompress a block range using gzip
+func decompressBlockRangeGz(in io.Reader, out io.Writer) (n int, err error) {
+	gzipReader, err := gzip.NewReader(in)
+	if err != nil {
+		return 0, err
+	}
+	written, err := io.Copy(out, gzipReader)
+	return int(written), err
+}
+
+// Utility function to decompress a block range using xz (lzma)
+func decompressBlockRangeXz(in io.Reader, out io.Writer) (n int, err error) {
+	// "Decompress" gzip (this should be in store mode)
+	var b bytes.Buffer
+	_, err = decompressBlockRangeGz(in, &b)
+	if err != nil {
+		return 0, err
+	}
+
+	// Decompress xz
+	// Initialize xz subprocess
+	subprocess := exec.Command(XZCommand, "-dc")
+	stdin, err := subprocess.StdinPipe()
+	if err != nil {
+		return 0, err
+	}
+
+	// Run subprocess that creates xz file
+	go func() {
+		defer stdin.Close()
+		io.Copy(stdin, &b)
+	}()
+
+	// Get output, copy, and return
+	output, err := subprocess.Output()
+	if err != nil {
+		return 0, err
+	}
+	n64, err := io.Copy(out, bytes.NewReader(output))
+	return int(n64), err
+}
+
+// Wrapper function to decompress a block range
+func decompressBlockRange(in io.Reader, out io.Writer) (n int, err error) {
+	switch CompressionMode { // Select decompression function based off compression mode
+		case GZIP_STORE: // See below
+		case GZIP_MIN: // See below
+		case GZIP_DEFAULT: // See below
+		case GZIP_MAX: return decompressBlockRangeGz(in, out)
+		case XZ_IN_GZ: return decompressBlockRangeXz(in, out)
+	}
+	return 0, errors.New("Compression mode doesn't exist") // If none of the above returned
+}
+
+/*** MAIN DECOMPRESSION INTERFACE ***/
 // ReadSeeker implementation for decompression
 type Decompressor struct {
 	cursorPos *int64		// The current location we have seeked to
 	blockStarts []int64		// The start of each block. These will be recovered from the block sizes
 	numBlocks uint32		// Number of blocks
 	decompressedSize int64		// Decompressed size of the file.
-	in *multigz.Reader		// Input
+	in io.ReadSeeker		// Input
 }
 
 // Decompression constants
 const LengthOffsetFromEnd = GzipDataAndFooterSize+4 // How far the 4-byte length of gzipped data is from the end
 const TrailingBytes = LengthOffsetFromEnd+2+GzipHeaderSize // This is the total size of the last gzip file in the stream, which is not included in the length of gzipped data
 
-// Initializes decompressor. Takes 2 reads if length of block data < InitialChunkLength or 3 reads otherwise
+// Initializes decompressor. Takes 3 reads. Works best with cached ReadSeeker.
 func (d* Decompressor) init(in io.ReadSeeker, size int64) error {
 	// Initialize cursor position
 	d.cursorPos = new(int64)
@@ -228,41 +451,80 @@ func (d* Decompressor) init(in io.ReadSeeker, size int64) error {
 	lastBlockRawSize := bytesToUint32(blockData[blockDataLen-4:])
 	d.decompressedSize = int64((d.numBlocks-1) * BlockSize + uint32(lastBlockRawSize))
 
-	// Initialize cursor position and create reader
+	// Initialize cursor position and copy over reader
 	*d.cursorPos = 0
 	in.Seek(0, io.SeekStart)
-	din, err := multigz.NewReader(in)
-	d.in = din
+	d.in = in
 
-	return err
+	return nil
 }
 
 // Reads data using a decompressor
 func (d Decompressor) Read(p []byte) (int, error) {	
-	// Check if this is off the ends of the file
+	log.Printf("Cursor pos before: %d\n", *d.cursorPos)
+	// Check if we're at the end of the file or before the beginning of the file
+	if *d.cursorPos >= d.decompressedSize || *d.cursorPos < 0 {
+		log.Println("Out of bounds EOF")
+		return 0, io.EOF
+	}
+
+	// Get block range to read
 	blockNumber := *d.cursorPos / BlockSize
-	if blockNumber < 0 || blockNumber >= int64(d.numBlocks) {
+	blockStart := d.blockStarts[blockNumber] // Start position of blocks to read
+	dataOffset := *d.cursorPos % BlockSize // Offset of data to read in blocks to read
+	bytesToRead := len(p) // Number of bytes to read
+	blocksToRead := (int64(bytesToRead) + dataOffset) / int64(BlockSize) + 1 // Number of blocks to read
+	var blockEnd int64 // End position of blocks to read
+	if blockNumber + blocksToRead < int64(d.numBlocks) {
+		blockEnd = d.blockStarts[blockNumber + blocksToRead] // Start of the next block after the last block is the end of the last block
+	} else {
+		blockEnd = d.blockStarts[d.numBlocks - 1] + MaxCompressedBlockSize // Always off the end of the last block
+	}
+	blockLen := blockEnd - blockStart
+	log.Printf("block # = %d @ %d, len %d", blockNumber, *d.cursorPos, blockLen)
+
+	// Read compressed block range into buffer
+	d.in.Seek(blockStart, io.SeekStart)
+	compressedBlocks := make([]byte, blockLen)
+	n, err := d.in.Read(compressedBlocks)
+	if err != nil {
+		return 0, err
+	}
+	log.Printf("Copied %d bytes from %d\n", n, blockStart)
+
+	// If we reached the end of the file, trim compressedBlocks to first n bytes
+	if int64(n) != blockLen {
+		compressedBlocks = compressedBlocks[:n]
+	}
+
+	// Decompress block range
+	var b bytes.Buffer
+	n, err = decompressBlockRange(bytes.NewReader(compressedBlocks), &b)
+	if err != nil {
+		return n, err
+	}
+
+	// Calculate bytes read
+	readOverflow := *d.cursorPos + int64(bytesToRead) - d.decompressedSize
+	if readOverflow < 0 {
+		readOverflow = 0
+	}
+	log.Printf("Read offset = %d, overflow = %d", dataOffset, readOverflow)
+	bytesRead := int64(bytesToRead) - readOverflow
+	log.Printf("Decompressed %d bytes; read %d out of %d bytes\n", n, bytesRead, bytesToRead)
+
+	// If we read 0 bytes, we reached the end of the file
+	if bytesRead == 0 {
 		return 0, io.EOF
 	}
 
-	// Get where read and seek to it in multigz
-	log.Printf("block # = %d @ %d", blockNumber, *d.cursorPos)
-	var mgzOffset multigz.Offset
-	mgzOffset.Block = d.blockStarts[blockNumber]
-	mgzOffset.Off = *d.cursorPos % BlockSize
-	err := d.in.Seek(mgzOffset)
-
-	// Read stuff
-	n, err := d.in.Read(p)
-
-	// If nothing was copied, we EOF'd
-	if n == 0 {
-		return 0, io.EOF
-	}
+	// Copy from buffer+offset to p
+	io.CopyN(ioutil.Discard, &b, dataOffset)
+	b.Read(p) // Note: everything after bytesToRead bytes will be discarded; we are returning bytesToRead instead of n
 
 	// Increment cursor position and return
-	*d.cursorPos += int64(n)
-	return n, err
+	*d.cursorPos += bytesRead
+	return int(bytesRead), err
 }
 
 // Seeks to a location in compressed stream
