@@ -16,6 +16,8 @@ Non-Configurable constants (or variables that act like constants):
 * TrailingBytes: Bytes after our block data gzip files
 
 Structure of file:
-* gzip data (or gzipped xz data). This is many individual gzip (or gzipped xz) files concatenated into a single stream
+* gzip data (or gzip-stored xz data). This is many individual gzip (or stored xz) files concatenated into a single stream
+	* In lz4, our block data is just a lot of lz4 frames.
 * empty gzip files containing block data (block data is gzipped into a gzip file then split among extra data fields in empty gzip files)
 * empty gzip file containing total size of all block data gzip files
+	* Our block data is treated as trailing garbage in lz4 are are ignored.
