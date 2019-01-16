@@ -43,15 +43,16 @@ type Compression struct {
 }
 
 // Create a Compression object with a preset mode/bs
-func NewCompressionPreset(preset int) (*Compression, error) {
+func NewCompressionPreset(preset string) (*Compression, error) {
 	switch preset {
-		case -1: return NewCompression(GZIP_STORE, 131070) // GZIP-store (dummy) compression
-		case 0: return NewCompression(LZ4, 262140) // LZ4 compression (very fast)
-		default: return NewCompression(GZIP_MIN, 131070) // GZIP-min compression (fast)
-		case 2: return NewCompression(GZIP_DEFAULT, 131070) // GZIP-default compression (medium)
-		case 3: return NewCompression(XZ_IN_GZ_MIN, 524288) // XZ-min compression (slow)
-		case 4: return NewCompression(XZ_IN_GZ, 1048576) // XZ-default compression (very slow)
+		case "gzip-store": return NewCompression(GZIP_STORE, 131070) // GZIP-store (dummy) compression
+		case "lz4": return NewCompression(LZ4, 262140) // LZ4 compression (very fast)
+		case "gzip-min": return NewCompression(GZIP_MIN, 131070) // GZIP-min compression (fast)
+		case "gzip-default": return NewCompression(GZIP_DEFAULT, 131070) // GZIP-default compression (medium)
+		case "xz-min": return NewCompression(XZ_IN_GZ_MIN, 524288) // XZ-min compression (slow)
+		case "xz-default": return NewCompression(XZ_IN_GZ, 1048576) // XZ-default compression (very slow)
 	}
+	return nil, errors.New("Compression mode doesn't exist")
 }
 
 // Create a Compression object with some default configuration values
@@ -90,10 +91,10 @@ func (c* Compression) GetFileExtension() string {
 		case GZIP_STORE: fallthrough
 		case GZIP_MIN: fallthrough
 		case GZIP_DEFAULT: fallthrough
-		case GZIP_MAX: return ".bin.gz"
-		case XZ_IN_GZ_MIN: return ".xz.gz"
-		case XZ_IN_GZ: return ".xz.gz"
-		case LZ4: return ".bin.lz4"
+		case GZIP_MAX: return ".gz"
+		case XZ_IN_GZ_MIN: fallthrough
+		case XZ_IN_GZ: return ".xzgz"
+		case LZ4: return ".lz4"
 	}
 	panic("Compression mode doesn't exist")
 }
@@ -113,7 +114,7 @@ func (c* Compression) GetFileCompressionInfo(reader io.Reader) (compressable boo
 
 	// If the data is not compressible, return so
 	if compressionRatio > c.MaxCompressionRatio {
-		return false, ".bin.bin", nil
+		return false, ".bin", nil
 	}
 
 	// If the file is compressible, select file extension based on compression mode

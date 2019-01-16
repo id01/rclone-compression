@@ -12,7 +12,7 @@ const testFileName = "test/test.vdi"
 const outFileName = "/dev/null"
 const outFileName2 = "test/testSeek.vdi"
 
-const Preset = 0
+const Preset = "lz4"
 
 func TestCompressFile(t *testing.T) {
 	comp, err := NewCompressionPreset(Preset)
