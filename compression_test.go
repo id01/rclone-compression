@@ -3,28 +3,19 @@ package press
 import (
 	"io"
 	"os"
+	"bufio"
 	"testing"
 //	"time"
 )
 
 const testFileName = "test/test.vdi"
-const outFileName = "test/testRead.vdi"
+const outFileName = "/dev/null"
 const outFileName2 = "test/testSeek.vdi"
 
-// Gzip compression configuration
-//const CompressionMode = GZIP_MIN // Compression mode
-//const BlockSize = 131070 // We're using 4 bytes instead now! Here's a block size of 128KB-2B!
-
-// XZ compression configuration
-//const CompressionMode = XZ_IN_GZ // Compression mode
-//const BlockSize = 1048576 // XZ needs larger block sizes to be more effective. Here's a 1MB block size.
-
-// LZ4 compression configuration
-const CompressionMode = LZ4_IN_GZ // Compression mode
-const BlockSize = 262140 // 256KB-4B block size
+const Preset = 0
 
 func TestCompressFile(t *testing.T) {
-	comp, err := NewCompression(CompressionMode, BlockSize)
+	comp, err := NewCompressionPreset(Preset)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +32,7 @@ func TestCompressFile(t *testing.T) {
 }
 
 func TestDecompressFile(t *testing.T) {
-	comp, err := NewCompression(CompressionMode, BlockSize)
+	comp, err := NewCompressionPreset(Preset)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,11 +53,12 @@ func TestDecompressFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("Decompressed size: %d\n", decompressedSize)
+	bufr := bufio.NewReaderSize(FileHandle, 12345678)
 	for {
-//		_, err := io.CopyN(outFil, FileHandle, 123456)
-		b := make([]byte, 12345678)
-		_, err := FileHandle.Read(b)
-		outFil.Write(b)
+		_, err := io.CopyN(outFil, bufr, 123456)
+//		b := make([]byte, 12345678)
+//		_, err := FileHandle.Read(b)
+//		outFil.Write(b)
 		if err == io.EOF {
 			break
 		}
@@ -79,7 +71,7 @@ func TestDecompressFile(t *testing.T) {
 }
 
 func TestSeek(t *testing.T) {
-	comp, err := NewCompression(CompressionMode, BlockSize)
+	comp, err := NewCompressionPreset(Preset)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +108,7 @@ func TestSeek(t *testing.T) {
 }
 
 func TestFileCompressionInfo(t *testing.T) {
-	comp, err := NewCompression(CompressionMode, BlockSize)
+	comp, err := NewCompressionPreset(Preset)
 	if err != nil {
 		t.Fatal(err)
 	}
