@@ -11,6 +11,9 @@ import (
 	"bufio"
 	"compress/gzip"
 	"os/exec"
+
+	"github.com/id01/lz4-go"
+	"github.com/golang/snappy"
 )
 
 // Compression modes
@@ -22,12 +25,12 @@ const (
 	XZ_IN_GZ_MIN = iota
 	XZ_IN_GZ = iota
 	LZ4 = iota
+	SNAPPY = iota
 )
 
 // Constants
 // Compression binaries
 const XZCommand = "xz" // Name of xz binary (if available)
-const LZ4Command = "lz4" // Name of lz4 binary (if available)
 // Debug mode
 const DEBUG = false
 
@@ -47,6 +50,7 @@ func NewCompressionPreset(preset string) (*Compression, error) {
 	switch preset {
 		case "gzip-store": return NewCompression(GZIP_STORE, 131070) // GZIP-store (dummy) compression
 		case "lz4": return NewCompression(LZ4, 262140) // LZ4 compression (very fast)
+		case "snappy": return NewCompression(SNAPPY, 262140) // Snappy compression (like LZ4, but slower and worse)
 		case "gzip-min": return NewCompression(GZIP_MIN, 131070) // GZIP-min compression (fast)
 		case "gzip-default": return NewCompression(GZIP_DEFAULT, 131070) // GZIP-default compression (medium)
 		case "xz-min": return NewCompression(XZ_IN_GZ_MIN, 524288) // XZ-min compression (slow)
@@ -57,7 +61,7 @@ func NewCompressionPreset(preset string) (*Compression, error) {
 
 // Create a Compression object with some default configuration values
 func NewCompression(mode int, bs uint32) (*Compression, error) {
-	return NewCompressionAdvanced(mode, bs, 1048576, 6, 0.9)
+	return NewCompressionAdvanced(mode, bs, 1048576, 12, 0.9)
 }
 
 // Create a Compression object
@@ -73,8 +77,6 @@ func NewCompressionAdvanced(mode int, bs uint32, hb int64, threads int, mcr floa
 	err = nil
 	if mode == XZ_IN_GZ || mode == XZ_IN_GZ_MIN {
 		c.BinPath, err = exec.LookPath(XZCommand)
-	} else if mode == LZ4 {
-		c.BinPath, err = exec.LookPath(LZ4Command)
 	}
 	return c, err
 }
@@ -95,18 +97,19 @@ func (c* Compression) GetFileExtension() string {
 		case XZ_IN_GZ_MIN: fallthrough
 		case XZ_IN_GZ: return ".xzgz"
 		case LZ4: return ".lz4"
+		case SNAPPY: return ".snap"
 	}
 	panic("Compression mode doesn't exist")
 }
 // Gets a file extension along with compressibility of file
 func (c* Compression) GetFileCompressionInfo(reader io.Reader) (compressable bool, extension string, err error) {
-	// Use gzip-min to do a fast heuristic on the first few bytes
+	// Use our compression algorithm to do a heuristic on the first few bytes
 	var emulatedBlock, emulatedBlockCompressed bytes.Buffer
 	_, err = io.CopyN(&emulatedBlock, reader, c.HeuristicBytes)
 	if err != nil {
 		return false, "", err
 	}
-	compressedSize, uncompressedSize, err := c.compressBlockGz(&emulatedBlock, &emulatedBlockCompressed, 1)
+	compressedSize, uncompressedSize, err := c.compressBlock(emulatedBlock.Bytes(), &emulatedBlockCompressed)
 	if err != nil {
 		return false, "", err
 	}
@@ -175,7 +178,7 @@ func gzipExtraify(in io.Reader, out io.Writer) {
 
 /*** BLOCK COMPRESSION FUNCTIONS ***/
 // Function that compresses a block using gzip
-func (c *Compression) compressBlockGz(in io.Reader, out io.Writer, compressionLevel int) (compressedSize uint32, uncompressedSize int64, err error) {
+func (c *Compression) compressBlockGz(in []byte, out io.Writer, compressionLevel int) (compressedSize uint32, uncompressedSize int64, err error) {
 	// Initialize buffer
 	bufw := bufio.NewWriterSize(out, int(c.maxCompressedBlockSize()))
 
@@ -186,18 +189,34 @@ func (c *Compression) compressBlockGz(in io.Reader, out io.Writer, compressionLe
 	}
 
 	// Compress block
-	n, err := io.Copy(outw, in)
+	outw.Write(in)
 
 	// Finalize gzip file, flush buffer and return
 	outw.Close()
 	blockSize := uint32(bufw.Buffered())
 	bufw.Flush()
 
-	return blockSize, n, err
+	return blockSize, int64(len(in)), err
+}
+
+// Function that compresses a block using lz4
+func (c *Compression) compressBlockLz4(in []byte, out io.Writer) (compressedSize uint32, uncompressedSize int64, err error) {
+	// Compress and return
+	outBytes, err := lz4.LZ4_compressFrame(in)
+	out.Write(outBytes)
+	return uint32(len(outBytes)), int64(len(in)), err
+}
+
+// Function that compresses a block using snappy
+func (c *Compression) compressBlockSnappy(in []byte, out io.Writer) (compressedSize uint32, uncompressedSize int64, err error) {
+	// Compress and return
+	outBytes := snappy.Encode(nil, in)
+	_, err = out.Write(outBytes)
+	return uint32(len(outBytes)), int64(len(in)), err
 }
 
 // Function that compresses a block using a shell command without wrapping in gzip. Requires an binary corresponding with the command.
-func (c *Compression) compressBlockExecNogz(in io.Reader, out io.Writer, binaryPath string, args []string) (compressedSize uint32, uncompressedSize int64, err error) {
+func (c *Compression) compressBlockExecNogz(in []byte, out io.Writer, binaryPath string, args []string) (compressedSize uint32, uncompressedSize int64, err error) {
 	// Initialize compression subprocess
 	subprocess := exec.Command(binaryPath, args...)
 	stdin, err := subprocess.StdinPipe()
@@ -206,11 +225,9 @@ func (c *Compression) compressBlockExecNogz(in io.Reader, out io.Writer, binaryP
 	}
 
 	// Run subprocess that creates compressed file
-	nChan := make(chan int64)
 	go func() {
-		n, _ := io.Copy(stdin, in)
+		stdin.Write(in)
 		stdin.Close()
-		nChan <- n
 	}()
 
 	// Get output
@@ -222,11 +239,11 @@ func (c *Compression) compressBlockExecNogz(in io.Reader, out io.Writer, binaryP
 	// Copy over and return
 	n, err := io.Copy(out, bytes.NewReader(output))
 
-	return uint32(n), <-nChan, err
+	return uint32(n), int64(len(in)), err
 }
 
 // Function that compresses a block using a shell command. Requires an binary corresponding with the command.
-func (c *Compression) compressBlockExecGz(in io.Reader, out io.Writer, binaryPath string, args []string) (compressedSize uint32, uncompressedSize int64, err error) {
+func (c *Compression) compressBlockExecGz(in []byte, out io.Writer, binaryPath string, args []string) (compressedSize uint32, uncompressedSize int64, err error) {
 	reachedEOF := false
 
 	// Compress without gzip wrapper
@@ -239,7 +256,7 @@ func (c *Compression) compressBlockExecGz(in io.Reader, out io.Writer, binaryPat
 	}
 
 	// Store in gzip and return
-	blockSize, _, err := c.compressBlockGz(&b, out, 0)
+	blockSize, _, err := c.compressBlockGz(b.Bytes(), out, 0)
 	if reachedEOF == true && err == nil {
 		err = io.EOF
 	}
@@ -247,7 +264,7 @@ func (c *Compression) compressBlockExecGz(in io.Reader, out io.Writer, binaryPat
 }
 
 // Wrapper function to compress a block
-func (c* Compression) compressBlock(in io.Reader, out io.Writer) (compressedSize uint32, uncompressedSize int64, err error) {
+func (c* Compression) compressBlock(in []byte, out io.Writer) (compressedSize uint32, uncompressedSize int64, err error) {
 	switch c.CompressionMode { // Select compression function (and arguments) based on compression mode
 		case GZIP_STORE: return c.compressBlockGz(in, out, 0)
 		case GZIP_MIN: return c.compressBlockGz(in, out, 1)
@@ -255,7 +272,8 @@ func (c* Compression) compressBlock(in io.Reader, out io.Writer) (compressedSize
 		case GZIP_MAX: return c.compressBlockGz(in, out, 9)
 		case XZ_IN_GZ: return c.compressBlockExecGz(in, out, XZCommand, []string{"-c"})
 		case XZ_IN_GZ_MIN: return c.compressBlockExecGz(in, out, XZCommand, []string{"-c1"})
-		case LZ4: return c.compressBlockExecNogz(in, out, LZ4Command, []string{"-c"})
+		case LZ4: return c.compressBlockLz4(in, out)
+		case SNAPPY: return c.compressBlockSnappy(in, out)
 	}
 	panic("Compression mode doesn't exist")
 }
@@ -291,7 +309,7 @@ func (c *Compression) CompressFile(in io.Reader, size int64, out io.Writer) erro
 				return err
 			}
 			// Run thread
-			go func(i int, in io.Reader){
+			go func(i int, in []byte){
 				// Initialize thread writer and result struct
 				var res CompressionResult
 				var buffer bytes.Buffer
@@ -313,7 +331,7 @@ func (c *Compression) CompressFile(in io.Reader, size int64, out io.Writer) erro
 				res.err = err
 				compressionResults[i] <- res
 				return
-			}(i, &inputBuffer)
+			}(i, inputBuffer.Bytes())
 			// If we have reached eof, we don't need more threads
 			if eofAt != -1 {
 				break
@@ -392,6 +410,24 @@ func decompressBlockRangeGz(in io.Reader, out io.Writer) (n int, err error) {
 	return int(written), err
 }
 
+// Utility function to decompress a block using snappy
+func decompressBlockSnappy(in io.Reader, out io.Writer) (n int, err error) {
+	var b bytes.Buffer
+	io.Copy(&b, in)
+	decompressed, err := snappy.Decode(nil, b.Bytes())
+	out.Write(decompressed)
+	return len(decompressed), err
+}
+
+// Utility function to decompress a block using LZ4
+func (d *Decompressor) decompressBlockLz4(in io.Reader, out io.Writer) (n int, err error) {
+	var b bytes.Buffer
+	io.Copy(&b, in)
+	decompressed, err := lz4.LZ4_decompressFrame(b.Bytes(), int64(d.c.BlockSize))
+	out.Write(decompressed)
+	return len(decompressed), err
+}
+
 // Utility function to decompress a block range using a shell command which wasn't wrapped in gzip
 func decompressBlockRangeExecNogz(in io.Reader, out io.Writer, binaryPath string, args []string) (n int, err error) {
 	// Decompress actual compression
@@ -439,7 +475,8 @@ func (d *Decompressor) decompressBlockRange(in io.Reader, out io.Writer) (n int,
 		case GZIP_MAX: return decompressBlockRangeGz(in, out)
 		case XZ_IN_GZ_MIN: return decompressBlockRangeExecGz(in, out, XZCommand, []string{"-dc1"})
 		case XZ_IN_GZ: return decompressBlockRangeExecGz(in, out, XZCommand, []string{"-dc"})
-		case LZ4: return decompressBlockRangeExecNogz(in, out, LZ4Command, []string{"-dc"})
+		case LZ4: return d.decompressBlockLz4(in, out)
+		case SNAPPY: return decompressBlockSnappy(in, out)
 	}
 	panic("Compression mode doesn't exist") // If none of the above returned
 }
