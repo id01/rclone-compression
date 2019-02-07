@@ -9,7 +9,7 @@ import (
 )
 
 const testFileName = "test/test.vdi"
-const outFileName = "/volatile/other/Downloads/stuff.vdi"
+const outFileName = "/dev/null"
 const outFileName2 = "test/testSeek.vdi"
 
 const Preset = "lz4"
